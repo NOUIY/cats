@@ -165,7 +165,7 @@ sealed abstract class Chain[+A] extends ChainCompat[A] {
   /**
    * Returns true if there are no elements in this collection.
    */
-  def isEmpty: Boolean = !this.isInstanceOf[Chain.NonEmpty[_]]
+  def isEmpty: Boolean = !this.isInstanceOf[Chain.NonEmpty[?]]
 
   /**
    * Returns false if there are no elements in this collection.
@@ -174,7 +174,7 @@ sealed abstract class Chain[+A] extends ChainCompat[A] {
 
   // Quick check whether the chain is either empty or contains one element only.
   @inline private def isEmptyOrSingleton: Boolean =
-    isEmpty || this.isInstanceOf[Chain.Singleton[_]]
+    isEmpty || this.isInstanceOf[Chain.Singleton[?]]
 
   /**
    * Concatenates this with `c` in O(1) runtime.
@@ -422,7 +422,7 @@ sealed abstract class Chain[+A] extends ChainCompat[A] {
    * {{{
    * scala> import scala.collection.immutable.SortedMap
    * scala> import cats.data.{Chain, NonEmptyChain}
-   * scala> import cats.implicits._
+   * scala> import cats.syntax.all._
    * scala> val chain = Chain(12, -2, 3, -5)
    * scala> val expectedResult = SortedMap(false -> NonEmptyChain(-2, -5), true -> NonEmptyChain(12, 3))
    * scala> val result = chain.groupBy(_ >= 0)
@@ -442,7 +442,7 @@ sealed abstract class Chain[+A] extends ChainCompat[A] {
    * {{{
    * scala> import scala.collection.immutable.SortedMap
    * scala> import cats.data.{Chain, NonEmptyChain}
-   * scala> import cats.implicits._
+   * scala> import cats.syntax.all._
    * scala> val chain = Chain(12, -2, 3, -5)
    * scala> val expectedResult = SortedMap(false -> NonEmptyChain("-2", "-5"), true -> NonEmptyChain("12", "3"))
    * scala> val result = chain.groupMap(_ >= 0)(_.toString)
@@ -477,7 +477,7 @@ sealed abstract class Chain[+A] extends ChainCompat[A] {
    * {{{
    * scala> import scala.collection.immutable.SortedMap
    * scala> import cats.data.Chain
-   * scala> import cats.implicits._
+   * scala> import cats.syntax.all._
    * scala> val chain = Chain("Hello", "World", "Goodbye", "World")
    * scala> val expectedResult = SortedMap("goodbye" -> 1, "hello" -> 1, "world" -> 2)
    * scala> val result = chain.groupMapReduce(_.trim.toLowerCase)(_ => 1)
@@ -499,7 +499,7 @@ sealed abstract class Chain[+A] extends ChainCompat[A] {
    * {{{
    * scala> import scala.collection.immutable.SortedMap
    * scala> import cats.data.Chain
-   * scala> import cats.implicits._
+   * scala> import cats.syntax.all._
    * scala> val chain = Chain("Hello", "World", "Goodbye", "World")
    * scala> val expectedResult = SortedMap("goodbye" -> 1, "hello" -> 1, "world" -> 2)
    * scala> val result = chain.groupMapReduceWith(_.trim.toLowerCase)(_ => 1)(_ + _)
@@ -863,7 +863,7 @@ sealed abstract class Chain[+A] extends ChainCompat[A] {
 
   override def equals(o: Any): Boolean =
     o match {
-      case thatChain: Chain[_] =>
+      case thatChain: Chain[?] =>
         (this: Chain[Any]).===(thatChain: Chain[Any])(Eq.fromUniversalEquals[Any])
       case _ => false
     }
@@ -909,7 +909,9 @@ sealed abstract class Chain[+A] extends ChainCompat[A] {
 @suppressUnusedImportWarningForScalaVersionSpecific
 object Chain extends ChainInstances with ChainCompanionCompat {
 
-  private val sentinel: Function1[Any, Any] = new scala.runtime.AbstractFunction1[Any, Any] { def apply(a: Any) = this }
+  private val sentinel: Function1[Any, Any] = new scala.runtime.AbstractFunction1[Any, Any] {
+    def apply(a: Any): Any = this
+  }
 
   sealed abstract private[data] class NonEmpty[A] extends Chain[A]
 
@@ -1201,7 +1203,7 @@ sealed abstract private[data] class ChainInstances extends ChainInstances1 {
   implicit def catsDataMonoidForChain[A]: Monoid[Chain[A]] = theMonoid.asInstanceOf[Monoid[Chain[A]]]
 
   implicit val catsDataInstancesForChain
-    : Traverse[Chain] with Alternative[Chain] with Monad[Chain] with CoflatMap[Chain] with Align[Chain] =
+    : Traverse[Chain] & Alternative[Chain] & Monad[Chain] & CoflatMap[Chain] & Align[Chain] =
     new Traverse[Chain] with Alternative[Chain] with Monad[Chain] with CoflatMap[Chain] with Align[Chain] {
       def foldLeft[A, B](fa: Chain[A], b: B)(f: (B, A) => B): B =
         fa.foldLeft(b)(f)
@@ -1241,11 +1243,54 @@ sealed abstract private[data] class ChainInstances extends ChainInstances1 {
       def traverse[G[_], A, B](fa: Chain[A])(f: A => G[B])(implicit G: Applicative[G]): G[Chain[B]] =
         if (fa.isEmpty) G.pure(Chain.nil)
         else
-          traverseViaChain {
-            val as = collection.mutable.ArrayBuffer[A]()
-            as ++= fa.iterator
-            KernelStaticMethods.wrapMutableIndexedSeq(as)
-          }(f)
+          G match {
+            case x: StackSafeMonad[G] =>
+              Traverse.traverseDirectly(fa.iterator)(f)(x)
+            case _ =>
+              traverseViaChain {
+                val as = collection.mutable.ArrayBuffer[A]()
+                as ++= fa.iterator
+                KernelStaticMethods.wrapMutableIndexedSeq(as)
+              }(f)
+          }
+
+      override def traverseVoid[G[_], A, B](fa: Chain[A])(f: A => G[B])(implicit G: Applicative[G]): G[Unit] =
+        G match {
+          case x: StackSafeMonad[G] => Traverse.traverseVoidDirectly(fa.iterator)(f)(x)
+          case _ =>
+            @tailrec
+            def go(fa: NonEmpty[A], rhs: Chain[A], acc: G[Unit]): G[Unit] =
+              fa match {
+                case Append(l, r) =>
+                  go(l, if (rhs.isEmpty) r else Append(r, rhs), acc)
+                case Wrap(as) =>
+                  val va = Foldable[collection.immutable.Seq].traverseVoid(as)(f)
+                  val acc1 = G.productL(acc)(va)
+                  rhs match {
+                    case Empty => acc1
+                    case ne: NonEmpty[A] =>
+                      go(ne, Empty, acc1)
+                  }
+                case Singleton(a) =>
+                  val acc1 = G.productL(acc)(f(a))
+                  rhs match {
+                    case Empty => acc1
+                    case ne: NonEmpty[A] =>
+                      go(ne, Empty, acc1)
+                  }
+              }
+
+            fa match {
+              case Empty => G.unit
+              case ne: NonEmpty[A] =>
+                go(ne, Empty, G.unit)
+            }
+        }
+
+      final override def toIterable[A](fa: Chain[A]): Iterable[A] = new scala.collection.AbstractIterable[A] {
+        final override def iterator: Iterator[A] =
+          fa.iterator
+      }
 
       override def mapAccumulate[S, A, B](init: S, fa: Chain[A])(f: (S, A) => (S, B)): (S, Chain[B]) =
         StaticMethods.mapAccumulateFromStrictFunctor(init, fa, f)(this)
@@ -1339,7 +1384,7 @@ sealed abstract private[data] class ChainInstances extends ChainInstances1 {
     }
 
   implicit val catsDataTraverseFilterForChain: TraverseFilter[Chain] = new TraverseFilter[Chain] {
-    def traverse: Traverse[Chain] = Chain.catsDataInstancesForChain
+    def traverse: Traverse[Chain] & Alternative[Chain] = Chain.catsDataInstancesForChain
 
     override def filter[A](fa: Chain[A])(f: A => Boolean): Chain[A] = fa.filter(f)
 
@@ -1354,11 +1399,16 @@ sealed abstract private[data] class ChainInstances extends ChainInstances1 {
     def traverseFilter[G[_], A, B](fa: Chain[A])(f: A => G[Option[B]])(implicit G: Applicative[G]): G[Chain[B]] =
       if (fa.isEmpty) G.pure(Chain.nil)
       else
-        traverseFilterViaChain {
-          val as = collection.mutable.ArrayBuffer[A]()
-          as ++= fa.iterator
-          KernelStaticMethods.wrapMutableIndexedSeq(as)
-        }(f)
+        G match {
+          case x: StackSafeMonad[G] =>
+            TraverseFilter.traverseFilterDirectly(fa.iterator)(f)(x)
+          case _ =>
+            traverseFilterViaChain {
+              val as = collection.mutable.ArrayBuffer[A]()
+              as ++= fa.iterator
+              KernelStaticMethods.wrapMutableIndexedSeq(as)
+            }(f)
+        }
 
     override def filterA[G[_], A](fa: Chain[A])(f: A => G[Boolean])(implicit G: Applicative[G]): G[Chain[A]] =
       traverse
